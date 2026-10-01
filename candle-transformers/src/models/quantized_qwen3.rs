@@ -454,7 +454,8 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
-    engram: Option<EngramStack>,
+    // Boxed so that models without Engram stay small.
+    engram: Option<Box<EngramStack>>,
     device: Device,
     dtype: DType,
     span: tracing::Span,
@@ -541,11 +542,11 @@ impl ModelWeights {
     /// Attaches Engram conditional memory to the decoder blocks listed in its config, see
     /// [`candle_nn::engram`]. The hidden states of this model are f32, so should be its modules.
     pub fn set_engram(&mut self, engram: Option<EngramStack>) {
-        self.engram = engram;
+        self.engram = engram.map(Box::new);
     }
 
     pub fn engram(&self) -> Option<&EngramStack> {
-        self.engram.as_ref()
+        self.engram.as_deref()
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {

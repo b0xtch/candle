@@ -401,7 +401,8 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    engram: Option<EngramStack>,
+    // Boxed so that models without Engram stay small.
+    engram: Option<Box<EngramStack>>,
     device: Device,
     dtype: DType,
 }
@@ -437,11 +438,11 @@ impl Model {
     /// Attaches Engram conditional memory to the decoder blocks listed in its config, see
     /// [`candle_nn::engram`]. Its modules must use the model dtype and hidden size.
     pub fn set_engram(&mut self, engram: Option<EngramStack>) {
-        self.engram = engram;
+        self.engram = engram.map(Box::new);
     }
 
     pub fn engram(&self) -> Option<&EngramStack> {
-        self.engram.as_ref()
+        self.engram.as_deref()
     }
 
     fn clear_kv_cache(&mut self) {

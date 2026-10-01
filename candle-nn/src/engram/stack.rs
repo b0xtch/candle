@@ -57,19 +57,13 @@ impl Clone for EngramStack {
 }
 
 impl EngramStack {
-    /// The hasher for `config`, with the padding id mapped through `projection`.
-    pub fn hasher(config: &EngramConfig, projection: &VocabProjection) -> Result<NgramHasher> {
-        let pad_id = projection.project(config.pad_id)?;
-        NgramHasher::new(config, projection.num_compressed(), pad_id)
-    }
-
     /// Groups modules built with [`Engram::new`], one per entry of `config.layer_ids`.
     pub fn new(
         config: EngramConfig,
         projection: VocabProjection,
         modules: Vec<Engram>,
     ) -> Result<Self> {
-        let hasher = Self::hasher(&config, &projection)?;
+        let hasher = NgramHasher::with_projection(&config, &projection)?;
         let mut layer_ids: Vec<usize> = modules.iter().map(|m| m.layer_id()).collect();
         layer_ids.sort_unstable();
         let mut expected = config.layer_ids.clone();
@@ -105,7 +99,7 @@ impl EngramStack {
         options: &EngramOptions,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let hasher = Self::hasher(&config, &projection)?;
+        let hasher = NgramHasher::with_projection(&config, &projection)?;
         let modules = hasher
             .layers()
             .iter()
@@ -125,7 +119,7 @@ impl EngramStack {
         &self.projection
     }
 
-    pub fn ngram_hasher(&self) -> &NgramHasher {
+    pub fn hasher(&self) -> &NgramHasher {
         &self.hasher
     }
 

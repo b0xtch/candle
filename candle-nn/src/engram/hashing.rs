@@ -5,6 +5,7 @@
 //! the accelerator, with rows fetched ahead of the layer that consumes them.
 use super::config::EngramConfig;
 use super::numpy_rng::Pcg64;
+use super::vocab::VocabProjection;
 use candle::Result;
 use std::collections::HashSet;
 
@@ -192,6 +193,13 @@ impl NgramHasher {
             pad_id,
             layers,
         })
+    }
+
+    /// The hasher for `cfg` over the canonical ids of `projection`, with the padding id mapped
+    /// through it as in the reference implementation.
+    pub fn with_projection(cfg: &EngramConfig, projection: &VocabProjection) -> Result<Self> {
+        let pad_id = projection.project(cfg.pad_id)?;
+        Self::new(cfg, projection.num_compressed(), pad_id)
     }
 
     pub fn max_ngram_size(&self) -> usize {

@@ -9,7 +9,7 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::engram::vocab::normalize;
 use candle_nn::engram::{
     reference_normalizer, Engram, EngramConfig, EngramOptions, EngramStack, HostQuantizedRows,
-    MemoryTable, MmapRows, Placement, TableOptions, VocabProjection,
+    MemoryTable, MmapRows, NgramHasher, Placement, TableOptions, VocabProjection,
 };
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use std::collections::HashMap;
@@ -90,7 +90,7 @@ fn load_modules(
     options: &EngramOptions,
 ) -> Result<(VocabProjection, Vec<Engram>)> {
     let projection = VocabProjection::from_tensor(get(f, &format!("{}.lookup", case.name)))?;
-    let hasher = EngramStack::hasher(&case.config, &projection)?;
+    let hasher = NgramHasher::with_projection(&case.config, &projection)?;
     let vb = VarBuilder::from_tensors(f.clone(), DType::F32, &Device::Cpu);
     let modules = hasher
         .layers()
@@ -186,7 +186,7 @@ fn hashing_matches_reference() -> Result<()> {
     let f = fixture()?;
     for case in cases() {
         let projection = VocabProjection::from_tensor(get(&f, &format!("{}.lookup", case.name)))?;
-        let hasher = EngramStack::hasher(&case.config, &projection)?;
+        let hasher = NgramHasher::with_projection(&case.config, &projection)?;
         let input = get(&f, &format!("{}.input_ids", case.name));
         let (b, t) = input.dims2()?;
         let tokens = projection.project_all(&ids(input)?)?;
@@ -222,7 +222,7 @@ fn module_matches_reference() -> Result<()> {
     let f = fixture()?;
     for case in cases() {
         let (projection, modules) = load_modules(&f, &case, &EngramOptions::default())?;
-        let hasher = EngramStack::hasher(&case.config, &projection)?;
+        let hasher = NgramHasher::with_projection(&case.config, &projection)?;
         let input = get(&f, &format!("{}.input_ids", case.name));
         let (b, t) = input.dims2()?;
         let tokens = projection.project_all(&ids(input)?)?;
