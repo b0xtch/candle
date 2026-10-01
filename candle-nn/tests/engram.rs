@@ -343,8 +343,25 @@ fn table_storage() -> Result<()> {
         assert!(t.lookup(&[300]).is_err());
     }
 
-    let dir = std::env::temp_dir().join(format!("candle-engram-{}", std::process::id()));
+    Ok(())
+}
+
+#[test]
+fn mmap_tables() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("candle-engram-mmap-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
+    // The mappings are dropped before the files are removed, which Windows requires.
+    let result = check_mmap_tables(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn check_mmap_tables(dir: &std::path::Path) -> Result<()> {
+    let device = Device::Cpu;
+    let table = Tensor::randn(0f32, 1., (300, 64), &device)?;
+    let ids = vec![0u32, 299, 17, 17, 42, 128];
+    let reference = MemoryTable::on_device(table.clone())?.lookup(&ids)?;
+
     // Memory-mapped safetensors, in the stored dtype.
     let path = dir.join("tables.safetensors");
     let tensors = HashMap::from([
@@ -382,7 +399,6 @@ fn table_storage() -> Result<()> {
     let expected = MemoryTable::offloaded(Arc::new(in_memory), &device, DType::F32);
     assert_eq!(t.storage_bytes(), 300 * 2 * 34);
     assert_eq!(max_abs_diff(&t.lookup(&ids)?, &expected.lookup(&ids)?)?, 0.);
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
