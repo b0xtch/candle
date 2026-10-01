@@ -85,8 +85,10 @@ impl SeedSequence {
             })
             .collect();
         words
-            .chunks_exact(2)
-            .map(|w| (w[0] as u64) | ((w[1] as u64) << 32))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[lo, hi]| (lo as u64) | ((hi as u64) << 32))
             .collect()
     }
 }
