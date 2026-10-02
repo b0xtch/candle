@@ -12,6 +12,7 @@ use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Storage, Tensor};
 use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 use candle_nn::attention::{flash_attn, AttnMask};
+use candle_nn::engram::EngramStack;
 use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
 use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
@@ -453,6 +454,8 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     lm_head: QMatMul,
+    // Boxed so that models without Engram stay small.
+    engram: Option<Box<EngramStack>>,
     device: Device,
     dtype: DType,
     span: tracing::Span,
@@ -528,6 +531,7 @@ impl ModelWeights {
             layers,
             norm,
             lm_head,
+            engram: None,
             device: device.clone(),
             dtype,
             span,
@@ -535,9 +539,22 @@ impl ModelWeights {
         })
     }
 
+    /// Attaches Engram conditional memory to the decoder blocks listed in its config, see
+    /// [`candle_nn::engram`]. The hidden states of this model are f32, so should be its modules.
+    pub fn set_engram(&mut self, engram: Option<EngramStack>) {
+        self.engram = engram.map(Box::new);
+    }
+
+    pub fn engram(&self) -> Option<&EngramStack> {
+        self.engram.as_deref()
+    }
+
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (_b, l) = input.dims2()?;
+        if let Some(engram) = self.engram.as_mut() {
+            engram.begin(input, offset)?;
+        }
         let mut h = self.embed_tokens.forward(input)?;
         // Skip mask materialization when using CPU flash attention
         let causal_mask = if l == 1 || self.device.is_cpu() {
@@ -551,7 +568,10 @@ impl ModelWeights {
                 self.dtype,
             )?)
         };
-        for layer in &mut self.layers {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if let Some(engram) = self.engram.as_mut() {
+                h = engram.apply(i, &h)?;
+            }
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
         }
         let h = self.norm.forward(&h)?;
@@ -563,6 +583,9 @@ impl ModelWeights {
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
+        }
+        if let Some(engram) = self.engram.as_mut() {
+            engram.reset();
         }
     }
 }

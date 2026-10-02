@@ -3,7 +3,7 @@ use crate::{
     utils::repeat_kv,
 };
 use candle::{DType, Device, Module, Result, Tensor};
-use candle_nn::{kv_cache::ConcatKvCache, Activation, VarBuilder};
+use candle_nn::{engram::EngramStack, kv_cache::ConcatKvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
 #[cfg(feature = "flash-attn")]
@@ -401,6 +401,8 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
+    // Boxed so that models without Engram stay small.
+    engram: Option<Box<EngramStack>>,
     device: Device,
     dtype: DType,
 }
@@ -427,19 +429,37 @@ impl Model {
             embed_tokens,
             layers,
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
+            engram: None,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Attaches Engram conditional memory to the decoder blocks listed in its config, see
+    /// [`candle_nn::engram`]. Its modules must use the model dtype and hidden size.
+    pub fn set_engram(&mut self, engram: Option<EngramStack>) {
+        self.engram = engram.map(Box::new);
+    }
+
+    pub fn engram(&self) -> Option<&EngramStack> {
+        self.engram.as_deref()
     }
 
     fn clear_kv_cache(&mut self) {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }
+        if let Some(engram) = self.engram.as_mut() {
+            engram.reset();
+        }
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_b, l) = input.dims2()?;
+        if let Some(engram) = self.engram.as_mut() {
+            // Hashes the n-grams and starts fetching their memory for all the Engram layers.
+            engram.begin(input, offset)?;
+        }
         let mut h = self.embed_tokens.forward(input)?;
 
         // Build causal mask only for the standard attention fallback path.
@@ -460,7 +480,10 @@ impl Model {
             None
         };
 
-        for layer in &mut self.layers {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if let Some(engram) = self.engram.as_mut() {
+                h = engram.apply(i, &h)?;
+            }
             h = layer.forward(&h, causal.as_ref(), offset)?;
         }
         self.norm.forward(&h)
@@ -494,5 +517,14 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+
+    /// See [`Model::set_engram`].
+    pub fn set_engram(&mut self, engram: Option<EngramStack>) {
+        self.base.set_engram(engram);
+    }
+
+    pub fn engram(&self) -> Option<&EngramStack> {
+        self.base.engram()
     }
 }
