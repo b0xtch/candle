@@ -7,6 +7,7 @@
 //! ```
 //!
 //! and its output is added to the residual stream before the attention of its decoder block.
+//! With `kernel_size: 0` there is no convolution and `Y = α ⊙ V`.
 use super::config::EngramConfig;
 use super::hashing::LayerHashParams;
 use super::table::{MemoryTable, PendingRows, Placement, TableOptions};
@@ -198,7 +199,7 @@ pub struct Engram {
     projections: Projections,
     key_norm: BranchNorm,
     query_norm: BranchNorm,
-    conv: ShortConv,
+    conv: Option<ShortConv>,
 }
 
 impl Engram {
@@ -208,9 +209,10 @@ impl Engram {
     /// Weights are named as in the reference implementation:
     /// `multi_head_embedding.embedding.weight` (the concatenated tables of all heads),
     /// `value_proj`, `key_projs.{m}`, `norm1.{m}` (keys), `norm2.{m}` (queries),
-    /// `short_conv.conv.weight` and `short_conv.norms.{m}`. The embedding table is stored as
-    /// requested by `options.table`; when it is kept off the compute device or compressed, it is
-    /// loaded on the CPU and never materialized on the device.
+    /// `short_conv.conv.weight` and `short_conv.norms.{m}` (unless `kernel_size` is 0). The
+    /// embedding table is stored as requested by `options.table`; when it is kept off the
+    /// compute device or compressed, it is loaded on the CPU and never materialized on the
+    /// device.
     pub fn new(
         cfg: &EngramConfig,
         params: &LayerHashParams,
@@ -299,6 +301,11 @@ impl Engram {
             Projections::Fused(Linear::new(Tensor::cat(&weights, 0)?, bias))
         };
         let eps = cfg.qk_norm_eps();
+        let conv = if cfg.kernel_size > 0 {
+            Some(ShortConv::new(cfg, hidden_size, vb.pp("short_conv"))?)
+        } else {
+            None
+        };
         Ok(Self {
             layer_id: params.layer_id,
             hidden_size,
@@ -308,7 +315,7 @@ impl Engram {
             projections,
             key_norm: BranchNorm::new(hc_mult, hidden_size, eps, vb.pp("norm1"))?,
             query_norm: BranchNorm::new(hc_mult, hidden_size, eps, vb.pp("norm2"))?,
-            conv: ShortConv::new(cfg, hidden_size, vb.pp("short_conv"))?,
+            conv,
         })
     }
 
@@ -337,7 +344,7 @@ impl Engram {
 
     /// Number of past positions kept in the convolution state.
     pub fn conv_state_len(&self) -> usize {
-        self.conv.state_len()
+        self.conv.as_ref().map_or(0, ShortConv::state_len)
     }
 
     /// Gathers the memory `e_t`, `(batch, seq_len, memory_dim)`, given the table rows of every
@@ -355,7 +362,7 @@ impl Engram {
     }
 
     /// Computes the module output `Y`, to be added to the residual stream, and the new
-    /// convolution state.
+    /// convolution state (`None` without convolution).
     ///
     /// * `hidden`: the hidden states `(B, T, D)`, or `(B, T, M, D)` for a backbone with `M`
     ///   residual branches; `Y` has the same shape.
@@ -367,7 +374,7 @@ impl Engram {
         hidden: &Tensor,
         memory: &Tensor,
         conv_state: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let single_branch = hidden.rank() == 3;
         let hidden = if single_branch {
             hidden.unsqueeze(2)?
@@ -404,8 +411,13 @@ impl Engram {
         let gate = (gate.abs()?.maximum(1e-6)?.sqrt()? * gate.sign()?)?;
         let gate = crate::ops::sigmoid(&gate)?.to_dtype(value.dtype())?;
         let gated = gate.broadcast_mul(&value.unsqueeze(2)?)?;
-        let (conv, conv_state) = self.conv.forward(&gated, conv_state)?;
-        let ys = (gated + conv)?;
+        let (ys, conv_state) = match &self.conv {
+            Some(conv) => {
+                let (conv, state) = conv.forward(&gated, conv_state)?;
+                ((gated + conv)?, Some(state))
+            }
+            None => (gated, None),
+        };
         let ys = if single_branch { ys.squeeze(2)? } else { ys };
         Ok((ys, conv_state))
     }

@@ -9,7 +9,8 @@ use candle::{DType, Device, Result, Tensor};
 use candle_nn::engram::vocab::normalize;
 use candle_nn::engram::{
     reference_normalizer, Engram, EngramConfig, EngramOptions, EngramStack, HostQuantizedRows,
-    MemoryTable, MmapRows, NgramHasher, Placement, TableOptions, VocabProjection,
+    HostRowStore, MemoryTable, MmapRows, Mxfp8Rows, NgramHasher, Placement, RowFormat,
+    TableOptions, VocabProjection,
 };
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use std::collections::HashMap;
@@ -314,24 +315,31 @@ fn table_storage() -> Result<()> {
     let reference = MemoryTable::on_device(table.clone())?.lookup(&ids)?;
     assert_eq!(reference.dims(), [6, 64]);
     let dense_bytes = 300 * 64 * 4;
-    let host = |compression| TableOptions {
+    let host = |compression: Option<RowFormat>| TableOptions {
         placement: Placement::Host,
         compression,
         prefetch: true,
     };
-    let on_device = |compression| TableOptions {
+    let on_device = |compression: Option<RowFormat>| TableOptions {
         placement: Placement::Device,
         compression,
         prefetch: false,
     };
     for (options, tolerance, bytes) in [
         (host(None), 0., dense_bytes),
-        (host(Some(GgmlDType::F16)), 5e-3, dense_bytes / 2),
-        (host(Some(GgmlDType::BF16)), 3e-2, dense_bytes / 2),
-        (host(Some(GgmlDType::Q8_0)), 3e-2, 300 * 2 * 34),
-        (host(Some(GgmlDType::Q4_0)), 0.6, 300 * 2 * 18),
-        (on_device(Some(GgmlDType::F16)), 5e-3, dense_bytes / 2),
-        (on_device(Some(GgmlDType::Q8_0)), 3e-2, 300 * 2 * 34),
+        (host(Some(GgmlDType::F16.into())), 5e-3, dense_bytes / 2),
+        (host(Some(DType::BF16.into())), 3e-2, dense_bytes / 2),
+        (host(Some(GgmlDType::Q8_0.into())), 3e-2, 300 * 2 * 34),
+        (host(Some(GgmlDType::Q4_0.into())), 0.6, 300 * 2 * 18),
+        (host(Some(RowFormat::Mxfp8)), 0.3, 300 * (64 + 2)),
+        (
+            on_device(Some(GgmlDType::F16.into())),
+            5e-3,
+            dense_bytes / 2,
+        ),
+        (on_device(Some(GgmlDType::Q8_0.into())), 3e-2, 300 * 2 * 34),
+        // On the CPU, MXFP8 tables are host tables.
+        (on_device(Some(RowFormat::Mxfp8)), 0.3, 300 * (64 + 2)),
     ] {
         let t = MemoryTable::from_tensor(table.clone(), &options, &device, DType::F32)?;
         assert_eq!(t.storage_bytes(), bytes, "{options:?}");
@@ -399,6 +407,198 @@ fn check_mmap_tables(dir: &std::path::Path) -> Result<()> {
     let expected = MemoryTable::offloaded(Arc::new(in_memory), &device, DType::F32);
     assert_eq!(t.storage_bytes(), 300 * 2 * 34);
     assert_eq!(max_abs_diff(&t.lookup(&ids)?, &expected.lookup(&ids)?)?, 0.);
+    Ok(())
+}
+
+#[test]
+fn mxfp8_tables() -> Result<()> {
+    // Known encodings: E4M3 0x38 = 1, 0x7e = 448 (the largest), 0xc0 = -2, 0x01 = 2^-9 (the
+    // smallest subnormal), 0x80 = -0, 0x7f = NaN, scaled by the E8M0 scales 2^(e - 127).
+    let mut values = vec![0u8; 128];
+    values[..6].copy_from_slice(&[0x38, 0x7e, 0xc0, 0x01, 0x80, 0x7f]);
+    values[32..34].copy_from_slice(&[0x38, 0xc0]);
+    values[64] = 0x38;
+    values[96] = 0x38;
+    let rows = Mxfp8Rows::new(values, vec![128, 127, 0, 255], 32)?;
+    assert_eq!(
+        (rows.num_rows(), rows.row_dim(), rows.storage_bytes()),
+        (4, 32, 132)
+    );
+    let decoded = rows.gather(&[0, 1, 2, 3])?.to_vec2::<f32>()?;
+    assert_eq!(decoded[0][..5], [2., 896., -4., 2f32.powi(-8), 0.]);
+    assert!(decoded[0][5].is_nan());
+    assert_eq!(decoded[1][..2], [1., -2.]);
+    assert_eq!(decoded[2][0], 2f32.powi(-127));
+    assert!(decoded[3][0].is_nan());
+    assert!(rows.gather(&[4]).is_err());
+    assert!(Mxfp8Rows::new(vec![0; 64], vec![0; 2], 48).is_err());
+    assert!(Mxfp8Rows::new(vec![0; 64], vec![0; 3], 32).is_err());
+
+    // Encoding picks the smallest power-of-two scale that fits each block of 32 values in the
+    // E4M3 range and rounds the values to nearest: the error is at most 2^-4 relative, or 2^-10
+    // of the block maximum for the values far below it.
+    let device = Device::Cpu;
+    let magnitudes = Tensor::new(&[1e-30f32, 1e-3, 1., 1e3, 1e30], &device)?;
+    let table = Tensor::randn(0f32, 1., (5, 4, 32), &device)?
+        .broadcast_mul(&magnitudes.reshape((5, 1, 1))?)?
+        .reshape((10, 64))?;
+    let rows = Mxfp8Rows::quantize(&table)?;
+    let ids: Vec<u32> = (0..10).collect();
+    let decoded = rows.gather(&ids)?.flatten_all()?.to_vec1::<f32>()?;
+    let table = table.flatten_all()?.to_vec1::<f32>()?;
+    for (block, decoded) in table.chunks(32).zip(decoded.chunks(32)) {
+        let amax = block.iter().fold(0f32, |m, x| m.max(x.abs()));
+        for (&x, &y) in block.iter().zip(decoded) {
+            let bound = x.abs().max(amax / 64.) / 16.;
+            assert!((x - y).abs() <= bound, "{x} decoded as {y}");
+        }
+    }
+    // Values that E4M3 represents are kept exactly, whatever the scale.
+    let exact = Tensor::new(
+        &[[448f32, -1.5, 0.25, 0.0, 3.75, -224.0, 2f32.powi(-9), 6.5]],
+        &device,
+    )?
+    .repeat((1, 4))?;
+    for scale in [1f32, 2f32.powi(-20), 2f32.powi(30)] {
+        let table = (&exact * scale as f64)?;
+        let decoded = Mxfp8Rows::quantize(&table)?.gather(&[0])?;
+        assert_eq!(max_abs_diff(&decoded, &table)?, 0., "scale {scale}");
+    }
+    // The values and scales round trip through the raw constructor.
+    let table = Tensor::randn(0f32, 1., (7, 96), &device)?;
+    let rows = Mxfp8Rows::quantize(&table)?;
+    let copy = Mxfp8Rows::new(rows.values().to_vec(), rows.scales().to_vec(), 96)?;
+    let ids = [6u32, 0, 3, 3];
+    assert_eq!(max_abs_diff(&rows.gather(&ids)?, &copy.gather(&ids)?)?, 0.);
+    Ok(())
+}
+
+#[test]
+fn mmap_mxfp8_tables() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("candle-engram-mxfp8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let result = check_mmap_mxfp8_tables(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn check_mmap_mxfp8_tables(dir: &std::path::Path) -> Result<()> {
+    use safetensors::tensor::TensorView;
+    use safetensors::Dtype;
+    let st_err = |e: safetensors::SafeTensorError| candle::Error::Msg(e.to_string());
+    let device = Device::Cpu;
+    let table = Tensor::randn(0f32, 1., (300, 64), &device)?;
+    let rows = Mxfp8Rows::quantize(&table)?;
+    let ones = vec![0x38u8; 6];
+    // Laid out as in DeepSeek-V4.1 checkpoints, next to an unrelated tensor.
+    let views = [
+        (
+            "embed.scale",
+            TensorView::new(Dtype::F8_E8M0, vec![300, 2], rows.scales()),
+        ),
+        (
+            "embed.weight",
+            TensorView::new(Dtype::F8_E4M3, vec![300, 64], rows.values()),
+        ),
+        ("other", TensorView::new(Dtype::F8_E4M3, vec![2, 3], &ones)),
+    ];
+    let views = views
+        .into_iter()
+        .map(|(name, view)| Ok((name, view.map_err(st_err)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let path = dir.join("tables.safetensors");
+    safetensors::serialize_to_file(views, None, &path).map_err(st_err)?;
+
+    let mapped = unsafe { MmapRows::from_safetensors_mxfp8(&path, "embed.weight", "embed.scale")? };
+    let t = MemoryTable::offloaded(Arc::new(mapped), &device, DType::F32);
+    let expected = MemoryTable::offloaded(Arc::new(rows), &device, DType::F32);
+    assert_eq!(t.storage_bytes(), 300 * (64 + 2));
+    assert_eq!(t.describe(), "mmap MXFP8");
+    let ids = vec![0u32, 299, 17, 17, 42, 128];
+    let rows = t.prefetch(ids.clone())?.wait()?;
+    assert_eq!(max_abs_diff(&rows, &expected.lookup(&ids)?)?, 0.);
+    assert!(
+        max_abs_diff(
+            &rows,
+            &table.index_select(&Tensor::new(ids.as_slice(), &device)?, 0)?
+        )? < 0.3
+    );
+    assert!(t.lookup(&[300]).is_err());
+
+    // Mismatched tensors are rejected.
+    for (name, scale_name) in [
+        ("embed.weight", "missing"),
+        ("embed.scale", "embed.scale"),
+        ("embed.weight", "embed.weight"),
+        ("other", "embed.scale"),
+    ] {
+        assert!(unsafe { MmapRows::from_safetensors_mxfp8(&path, name, scale_name) }.is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn without_convolution() -> Result<()> {
+    let device = Device::Cpu;
+    let with_conv = EngramConfig {
+        engram_vocab_size: vec![101, 103],
+        n_embed_per_ngram: 16,
+        n_head_per_ngram: 2,
+        layer_ids: vec![1],
+        hc_mult: 2,
+        ..EngramConfig::reference_demo(2)
+    };
+    let without_conv = EngramConfig {
+        kernel_size: 0,
+        ..with_conv.clone()
+    };
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let projection = VocabProjection::identity(40);
+    let options = EngramOptions::default();
+    let mut conv = EngramStack::load(with_conv, projection.clone(), 8, &options, vb.pp("layers"))?;
+    let n_vars = varmap.all_vars().len();
+    // Same weights, minus the convolution which is not loaded.
+    let mut plain = EngramStack::load(without_conv, projection, 8, &options, vb.pp("layers"))?;
+    assert_eq!(varmap.all_vars().len(), n_vars);
+    assert_eq!(plain.modules()[0].conv_state_len(), 0);
+
+    let input = Tensor::new(&[[3u32, 7, 7, 1, 9, 3, 7, 2]], &device)?;
+    let xs = Tensor::randn(0f32, 1., (1, 8, 2, 8), &device)?;
+    conv.begin(&input, 0)?;
+    plain.begin(&input, 0)?;
+    let expected = conv.apply(1, &xs)?;
+    // The zero-initialized convolution only adds SiLU(0) = 0.
+    let full = plain.apply(1, &xs)?;
+    assert_eq!(max_abs_diff(&full, &expected)?, 0.);
+    assert!(max_abs_diff(&full, &xs)? > 1e-3);
+    let mut chunks = vec![];
+    for (start, len) in [(0, 3), (3, 1), (4, 4)] {
+        plain.begin(&input.narrow(1, start, len)?, start)?;
+        chunks.push(plain.apply(1, &xs.narrow(1, start, len)?)?);
+    }
+    assert!(max_abs_diff(&Tensor::cat(&chunks, 1)?, &full)? < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn deepseek_v41_table_sizes() -> Result<()> {
+    // DeepSeek-V4.1-Flash hashes 2/3/4-grams with 8 heads of 16M buckets each at blocks 1 and
+    // 14, over a compressed vocabulary of 99092 ids. Its config lists the resulting table sizes
+    // as `engram_num_embeddings`.
+    let config = EngramConfig {
+        engram_vocab_size: vec![16_000_000; 3],
+        max_ngram_size: 4,
+        n_embed_per_ngram: 8 * 256,
+        n_head_per_ngram: 8,
+        layer_ids: vec![1, 14],
+        kernel_size: 0,
+        ..EngramConfig::reference_demo(4)
+    };
+    let hasher = NgramHasher::new(&config, 99092, 2)?;
+    let rows: Vec<u64> = hasher.layers().iter().map(|l| l.num_rows).collect();
+    assert_eq!(rows, [384006168, 384016682]);
+    assert_eq!(config.memory_dim(), 6144);
     Ok(())
 }
 

@@ -53,7 +53,8 @@ pub struct EngramConfig {
     /// Seed of the hash multipliers.
     #[serde(default)]
     pub seed: u64,
-    /// Kernel size of the depthwise causal convolution (its dilation is `max_ngram_size`).
+    /// Kernel size of the depthwise causal convolution (its dilation is `max_ngram_size`). `0`
+    /// removes the convolution, as in DeepSeek-V4.1, so that the module returns the gated value.
     #[serde(default = "default_kernel_size")]
     pub kernel_size: usize,
     /// Number of residual branches (`M` in the paper). Standard transformers use 1, the paper
@@ -139,9 +140,6 @@ impl EngramConfig {
         }
         if self.n_embed_per_ngram == 0 {
             candle::bail!("engram: n_embed_per_ngram must be positive")
-        }
-        if self.kernel_size == 0 {
-            candle::bail!("engram: kernel_size must be positive")
         }
         if self.hc_mult == 0 {
             candle::bail!("engram: hc_mult must be positive")

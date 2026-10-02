@@ -236,7 +236,7 @@ impl EngramStack {
             .wait()?
             .reshape((batch, seq_len, module.memory_dim()))?;
         let (ys, state) = module.forward(xs, &memory, self.conv_states[i].as_ref())?;
-        self.conv_states[i] = Some(state);
+        self.conv_states[i] = state;
         xs + ys
     }
 }

@@ -11,8 +11,10 @@ This example attaches Engram, from `candle_nn::engram`, to a quantized Qwen3 mod
 storage options:
 
 - `--storage device|host|mmap`: tables on the compute device, in host memory with only the
-  looked up rows copied to the device, or memory mapped from a GGUF file and paged in on demand.
-- `--compression none|f16|bf16|q8_0|q4_0`: how the tables are encoded.
+  looked up rows copied to the device, or memory mapped from a file and paged in on demand.
+- `--compression none|f16|bf16|q8_0|q4_0|mxfp8`: how the tables are encoded. MXFP8 (E4M3
+  values with a power-of-two scale per 32 values) is the format of DeepSeek-V4.1's Engram
+  tables; it is decoded on the host, so on a GPU it needs `--storage host` or `mmap`.
 - `--no-prefetch`: gather offloaded rows when the Engram layer runs rather than on a background
   thread as soon as the token ids are known.
 
@@ -31,10 +33,11 @@ cargo run --example engram --release -- --storage host --compression q8_0 --comp
 The run prints the size and location of every table, the prompt and generation speed with and
 without Engram, and checks that both runs produce the same tokens.
 
-Tables larger than memory can be memory mapped; the file is written on the first run:
+Tables larger than memory can be memory mapped. The file is written on the first run, as GGUF
+or for MXFP8 as safetensors (`engram-tables-{compression}.gguf` or `.safetensors` by default):
 
 ```bash
-cargo run --example engram --release -- --storage mmap --compression q4_0 --tables-file engram.gguf
+cargo run --example engram --release -- --storage mmap --compression q4_0
 ```
 
 Trained modules are loaded with `--engram-weights model.safetensors --engram-config engram.json`,
@@ -77,3 +80,7 @@ for (i, layer) in self.layers.iter_mut().enumerate() {
 ```
 
 and `engram.reset()` wherever the KV cache is cleared.
+
+The modules follow the reference implementation by default. Setting `kernel_size` to 0 removes
+the short convolution, as in DeepSeek-V4.1, whose MXFP8 tables (`embed.weight` and `embed.scale`
+of each Engram layer) can be memory mapped as they are with `MmapRows::from_safetensors_mxfp8`.

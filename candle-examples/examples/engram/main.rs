@@ -8,8 +8,8 @@ use anyhow::{Error as E, Result};
 use candle::quantized::{gguf_file, GgmlDType, QTensor};
 use candle::{DType, Device, Shape, Tensor};
 use candle_nn::engram::{
-    Engram, EngramConfig, EngramOptions, EngramStack, MemoryTable, MmapRows, NgramHasher,
-    Placement, TableOptions, VocabProjection,
+    Engram, EngramConfig, EngramOptions, EngramStack, HostRowStore, MemoryTable, MmapRows,
+    Mxfp8Rows, NgramHasher, Placement, RowFormat, TableOptions, VocabProjection,
 };
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::{Init, VarBuilder};
@@ -26,7 +26,7 @@ enum Storage {
     Device,
     /// In host memory, only the looked up rows are copied to the device.
     Host,
-    /// Memory mapped from a GGUF file, paged in on demand by the operating system.
+    /// Memory mapped from a file, paged in on demand by the operating system.
     Mmap,
 }
 
@@ -39,16 +39,39 @@ enum Compression {
     Q8_0,
     #[value(name = "q4_0")]
     Q4_0,
+    /// E4M3 values with a power-of-two scale per 32 values, as in DeepSeek-V4.1.
+    Mxfp8,
 }
 
 impl Compression {
-    fn ggml_dtype(&self) -> Option<GgmlDType> {
+    fn format(&self) -> Option<RowFormat> {
         match self {
             Self::None => None,
+            Self::F16 => Some(DType::F16.into()),
+            Self::Bf16 => Some(DType::BF16.into()),
+            Self::Q8_0 => Some(GgmlDType::Q8_0.into()),
+            Self::Q4_0 => Some(GgmlDType::Q4_0.into()),
+            Self::Mxfp8 => Some(RowFormat::Mxfp8),
+        }
+    }
+
+    /// The GGML type of the tables written to GGUF files, `None` for MXFP8 which is written to
+    /// safetensors files.
+    fn ggml_dtype(&self) -> Option<GgmlDType> {
+        match self {
+            Self::None => Some(GgmlDType::F32),
             Self::F16 => Some(GgmlDType::F16),
             Self::Bf16 => Some(GgmlDType::BF16),
             Self::Q8_0 => Some(GgmlDType::Q8_0),
             Self::Q4_0 => Some(GgmlDType::Q4_0),
+            Self::Mxfp8 => None,
+        }
+    }
+
+    fn tables_file(&self) -> String {
+        match self.ggml_dtype() {
+            Some(dtype) => format!("engram-tables-{}.gguf", format!("{dtype:?}").to_lowercase()),
+            None => "engram-tables-mxfp8.safetensors".to_string(),
         }
     }
 }
@@ -102,9 +125,10 @@ struct Args {
     #[arg(long, value_enum, default_value = "q8_0")]
     compression: Compression,
 
-    /// GGUF file holding the tables for `--storage mmap`, written when it does not exist.
-    #[arg(long, default_value = "engram-tables.gguf")]
-    tables_file: String,
+    /// File holding the tables for `--storage mmap`, written when it does not exist: GGUF, or
+    /// safetensors for MXFP8. Defaults to `engram-tables-{compression}.{gguf,safetensors}`.
+    #[arg(long)]
+    tables_file: Option<String>,
 
     /// Gather offloaded rows when the layer needs them instead of ahead of time.
     #[arg(long)]
@@ -173,13 +197,18 @@ fn table_name(layer_id: usize) -> String {
     format!("blk.{layer_id}.engram.embd.weight")
 }
 
-/// Writes the embedding tables of every Engram layer to a GGUF file, encoded as `dtype`.
+fn scale_name(layer_id: usize) -> String {
+    format!("blk.{layer_id}.engram.embd.scale")
+}
+
+/// Writes the embedding tables of every Engram layer, encoded as `compression`: to a GGUF file,
+/// or for MXFP8 to a safetensors file holding the values and the scales of each table.
 fn write_tables(
     path: &str,
     config: &EngramConfig,
     hasher: &NgramHasher,
     vb: &VarBuilder,
-    dtype: GgmlDType,
+    compression: Compression,
 ) -> Result<()> {
     let mut tables = vec![];
     for params in hasher.layers() {
@@ -195,14 +224,37 @@ fn write_tables(
                     stdev: 1.,
                 },
             )?;
-        tables.push((
-            table_name(params.layer_id),
-            QTensor::quantize(&table, dtype)?,
-        ));
+        tables.push((params.layer_id, table));
     }
-    let tensors: Vec<(&str, &QTensor)> = tables.iter().map(|(n, t)| (n.as_str(), t)).collect();
-    let mut file = std::fs::File::create(path)?;
-    gguf_file::write(&mut file, &[], &tensors)?;
+    match compression.ggml_dtype() {
+        Some(dtype) => {
+            let tables = tables
+                .iter()
+                .map(|(id, t)| Ok((table_name(*id), QTensor::quantize(t, dtype)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let tensors: Vec<(&str, &QTensor)> =
+                tables.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            let mut file = std::fs::File::create(path)?;
+            gguf_file::write(&mut file, &[], &tensors)?;
+        }
+        None => {
+            use safetensors::{tensor::TensorView, Dtype};
+            let tables = tables
+                .iter()
+                .map(|(id, t)| Ok((*id, Mxfp8Rows::quantize(t)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut views = vec![];
+            for (id, rows) in tables.iter() {
+                let (num_rows, dim) = (rows.num_rows(), rows.row_dim());
+                let values = TensorView::new(Dtype::F8_E4M3, vec![num_rows, dim], rows.values())?;
+                let scales =
+                    TensorView::new(Dtype::F8_E8M0, vec![num_rows, dim / 32], rows.scales())?;
+                views.push((table_name(*id), values));
+                views.push((scale_name(*id), scales));
+            }
+            safetensors::serialize_to_file(views, None, std::path::Path::new(path))?;
+        }
+    }
     Ok(())
 }
 
@@ -291,7 +343,7 @@ fn main() -> Result<()> {
                 Storage::Device => Placement::Device,
                 Storage::Host | Storage::Mmap => Placement::Host,
             },
-            compression: args.compression.ggml_dtype(),
+            compression: args.compression.format(),
             prefetch: !args.no_prefetch,
         },
         zero_init_value: args.engram_weights.is_none(),
@@ -299,17 +351,28 @@ fn main() -> Result<()> {
     let start = std::time::Instant::now();
     let engram = if args.storage == Storage::Mmap {
         let hasher = NgramHasher::with_projection(&config, &projection)?;
-        if !std::path::Path::new(&args.tables_file).exists() {
-            let dtype = args.compression.ggml_dtype().unwrap_or(GgmlDType::F32);
-            println!("writing the {dtype:?} tables to {}", args.tables_file);
-            write_tables(&args.tables_file, &config, &hasher, &vb, dtype)?;
+        let tables_file = match &args.tables_file {
+            Some(path) => path.clone(),
+            None => args.compression.tables_file(),
+        };
+        if !std::path::Path::new(&tables_file).exists() {
+            println!("writing the tables to {tables_file}");
+            write_tables(&tables_file, &config, &hasher, &vb, args.compression)?;
         }
         let modules = hasher
             .layers()
             .iter()
             .map(|params| {
+                let id = params.layer_id;
                 let rows = unsafe {
-                    MmapRows::from_gguf(&args.tables_file, &table_name(params.layer_id))?
+                    match args.compression {
+                        Compression::Mxfp8 => MmapRows::from_safetensors_mxfp8(
+                            &tables_file,
+                            &table_name(id),
+                            &scale_name(id),
+                        )?,
+                        _ => MmapRows::from_gguf(&tables_file, &table_name(id))?,
+                    }
                 };
                 let table = MemoryTable::offloaded(Arc::new(rows), &device, DType::F32)
                     .with_prefetch(!args.no_prefetch);
